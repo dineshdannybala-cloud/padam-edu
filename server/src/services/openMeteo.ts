@@ -24,7 +24,17 @@ const CURRENT_FIELDS = [
   "surface_pressure"
 ].join(",");
 
+const HOURLY_FIELDS = [
+  "temperature_2m",
+  "apparent_temperature",
+  "weather_code",
+  "precipitation_probability",
+  "wind_speed_10m",
+  "wind_direction_10m"
+].join(",");
+
 const DAILY_FIELDS = [
+  "weather_code",
   "sunrise",
   "sunset",
   "uv_index_max",
@@ -180,24 +190,27 @@ export async function getLocationData(
   longitude: number,
   timezone = "auto"
 ): Promise<LocationDataResponse> {
-  const url = new URL(FORECAST_URL);
-  url.searchParams.set("latitude", latitude.toString());
-  url.searchParams.set("longitude", longitude.toString());
-  url.searchParams.set("timezone", timezone);
-  url.searchParams.set("forecast_days", "1");
-  url.searchParams.set("current", CURRENT_FIELDS);
-  url.searchParams.set("daily", DAILY_FIELDS);
+  const params = new URLSearchParams({
+    latitude: latitude.toString(),
+    longitude: longitude.toString(),
+    current: CURRENT_FIELDS,
+    daily: DAILY_FIELDS,
+    hourly: HOURLY_FIELDS,
+    forecast_days: "10",
+    timezone: "auto"
+  });
 
-  const response = await fetch(url);
+  const forecastResponse = await fetch(`${FORECAST_URL}?${params.toString()}`);
 
-  if (!response.ok) {
-    throw new Error(`Forecast API failed with status ${response.status}`);
+  if (!forecastResponse.ok) {
+    throw new Error(`Forecast API failed with status ${forecastResponse.status}`);
   }
 
-  const data = (await response.json()) as Record<string, unknown>;
+  const data = (await forecastResponse.json()) as Record<string, unknown>;
   const resolvedTimezone = (data.timezone as string) ?? timezone;
 
   const daily = (data.daily as Record<string, Array<string | number | null>>) ?? {};
+  const hourly = (data.hourly as Record<string, Array<string | number | null>>) ?? {};
 
   try {
     const moon = await getMoonData(latitude, longitude, resolvedTimezone);
@@ -215,6 +228,7 @@ export async function getLocationData(
       timezone: resolvedTimezone
     },
     current: (data.current as Record<string, number | string | null>) ?? {},
-    daily
+    daily,
+    hourly
   };
 }

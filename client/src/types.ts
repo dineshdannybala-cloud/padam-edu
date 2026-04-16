@@ -17,4 +17,5 @@ export type LocationData = {
   };
   current: Record<string, number | string | null>;
   daily: Record<string, Array<string | number | null>>;
+  hourly: Record<string, Array<string | number | null>>;
 };

@@ -3,8 +3,11 @@ import maplibregl, { Map as MapLibreMap, Marker } from "maplibre-gl";
 import type { StyleSpecification } from "maplibre-gl";
 import { getLocationData, reverseGeocode, searchPlaces } from "./api";
 import type { LocationData, Place } from "./types";
+import DailyForecast from "./components/DailyForecast";
+import HourlyForecast from "./components/HourlyForecast";
 
 type MapMode = "streets" | "satellite";
+type TimezoneMode = "location" | "user" | "utc" | "custom";
 
 const STREET_STYLE_URL = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json";
 
@@ -90,6 +93,83 @@ function formatPlaceLabel(place: Place): string {
   return [place.name, place.admin1, place.country].filter(Boolean).join(", ");
 }
 
+function isValidTimezone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getDayKey(date: Date, timezone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function getHour24(date: Date, timezone: string): number {
+  return Number(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "2-digit",
+      hourCycle: "h23"
+    }).format(date)
+  );
+}
+
+function formatHour(date: Date, timezone: string): string {
+  return date.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    timeZone: timezone
+  });
+}
+
+function formatDayFromRaw(rawDay: string, timezone: string): string {
+  const normalized = rawDay.includes("T") ? new Date(rawDay) : new Date(`${rawDay}T12:00:00Z`);
+  return normalized.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    timeZone: timezone
+  });
+}
+
+function formatTimeValue(value: string | number | null | undefined, timezone: string): string {
+  if (typeof value !== "string") {
+    return "N/A";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "N/A";
+  }
+
+  return date.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "numeric",
+    timeZone: timezone
+  });
+}
+
+function formatMetric(value: string | number | null | undefined, unit: string): string {
+  if (value === null || value === undefined || value === "") {
+    return "N/A";
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? `${Math.round(n)} ${unit}` : "N/A";
+}
+
+function getWeatherLabelFromCode(code: number): string {
+  if (!Number.isFinite(code)) {
+    return "Unknown";
+  }
+  return WEATHER_CODE_MAP[code] ?? `Code ${code}`;
+}
+
 export default function App() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -103,6 +183,14 @@ export default function App() {
   const [dataLoading, setDataLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mapMode, setMapMode] = useState<MapMode>("streets");
+  const [selectedDayIndex, setSelectedDayIndex] = useState(0);
+  const [selectedHourKey, setSelectedHourKey] = useState<string | null>(null);
+  const [timezoneMode, setTimezoneMode] = useState<TimezoneMode>("location");
+  const [customTimezoneInput, setCustomTimezoneInput] = useState("");
+  const [customTimezoneApplied, setCustomTimezoneApplied] = useState("");
+  const [timezoneError, setTimezoneError] = useState<string | null>(null);
+
+  const userTimezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) {
@@ -189,13 +277,19 @@ export default function App() {
     return () => globalThis.clearTimeout(timer);
   }, [search]);
 
-  const weatherLabel = useMemo(() => {
-    const code = Number(locationData?.current?.weather_code ?? Number.NaN);
-    if (!Number.isFinite(code)) {
-      return "Unknown";
+  const locationTimezone = locationData?.location.timezone ?? "UTC";
+  const effectiveTimezone = useMemo(() => {
+    if (timezoneMode === "location") {
+      return locationTimezone;
     }
-    return WEATHER_CODE_MAP[code] ?? `Code ${code}`;
-  }, [locationData]);
+    if (timezoneMode === "user") {
+      return userTimezone;
+    }
+    if (timezoneMode === "utc") {
+      return "UTC";
+    }
+    return isValidTimezone(customTimezoneApplied) ? customTimezoneApplied : locationTimezone;
+  }, [customTimezoneApplied, locationTimezone, timezoneMode, userTimezone]);
 
   async function selectPlace(place: Place, flyTo = true) {
     setSelectedPlace(place);
@@ -205,6 +299,10 @@ export default function App() {
     try {
       const data = await getLocationData(place.latitude, place.longitude, place.timezone ?? "auto");
       setLocationData(data);
+      setSelectedDayIndex(0);
+      setSelectedHourKey(null);
+      setTimezoneMode("location");
+      setTimezoneError(null);
 
       const map = mapRef.current;
       if (map) {
@@ -228,12 +326,231 @@ export default function App() {
 
   const daily = locationData?.daily ?? {};
   const current = locationData?.current ?? {};
+  const hourly = locationData?.hourly ?? {};
+
+  const dailyTimes = (daily.time as string[] | undefined) ?? [];
+
+  const dailyItems = useMemo(() => {
+    const weatherCodes = daily.weather_code as Array<string | number | null> | undefined;
+    const sunriseSeries = daily.sunrise as Array<string | number | null> | undefined;
+    const sunsetSeries = daily.sunset as Array<string | number | null> | undefined;
+
+    return dailyTimes.slice(0, 10).map((rawDay, index) => {
+      const code = Number(weatherCodes?.[index] ?? Number.NaN);
+      const label =
+        index === 0 ? "Today" : index === 1 ? "Tomorrow" : formatDayFromRaw(rawDay, effectiveTimezone);
+
+      const sunrise = formatTimeValue(sunriseSeries?.[index], effectiveTimezone);
+      const sunset = formatTimeValue(sunsetSeries?.[index], effectiveTimezone);
+
+      return {
+        key: `${rawDay}-${index}`,
+        rawDay,
+        index,
+        label,
+        sunLabel: `${sunrise} / ${sunset}`,
+        weatherCode: Number.isFinite(code) ? code : -1
+      };
+    });
+  }, [daily.sunrise, daily.sunset, daily.weather_code, dailyTimes, effectiveTimezone]);
+
+  useEffect(() => {
+    if (dailyItems.length === 0) {
+      return;
+    }
+    if (selectedDayIndex >= dailyItems.length) {
+      setSelectedDayIndex(0);
+    }
+  }, [dailyItems.length, selectedDayIndex]);
+
+  const selectedDayRaw = dailyItems[selectedDayIndex]?.rawDay;
+  const selectedDayKey = selectedDayRaw
+    ? getDayKey(
+        selectedDayRaw.includes("T") ? new Date(selectedDayRaw) : new Date(`${selectedDayRaw}T12:00:00Z`),
+        effectiveTimezone
+      )
+    : null;
+
+  const hourlyItems = useMemo(() => {
+    if (!selectedDayRaw || !selectedDayKey) {
+      return [] as Array<{
+        key: string;
+        label: string;
+        temperature: string;
+        weatherCode: number;
+        index: number;
+      }>;
+    }
+
+    const times = (hourly.time as string[] | undefined) ?? [];
+    const temperatures = hourly.temperature_2m as Array<string | number | null> | undefined;
+    const weatherCodes = hourly.weather_code as Array<string | number | null> | undefined;
+
+    const now = new Date();
+    const todayKey = getDayKey(now, effectiveTimezone);
+    const currentHour = getHour24(now, effectiveTimezone);
+    const isTodaySelected = selectedDayKey === todayKey;
+
+    const filtered = times
+      .map((rawTime, index) => {
+        const date = new Date(rawTime);
+        if (Number.isNaN(date.getTime())) {
+          return null;
+        }
+
+        const matchesDay =
+          timezoneMode === "location" && /^\d{4}-\d{2}-\d{2}$/.test(selectedDayRaw)
+            ? rawTime.startsWith(selectedDayRaw)
+            : getDayKey(date, effectiveTimezone) === selectedDayKey;
+
+        if (!matchesDay) {
+          return null;
+        }
+
+        if (isTodaySelected && getHour24(date, effectiveTimezone) < currentHour) {
+          return null;
+        }
+
+        const code = Number(weatherCodes?.[index] ?? Number.NaN);
+        const temp = Number(temperatures?.[index] ?? Number.NaN);
+
+        return {
+          key: rawTime,
+          rawTime,
+          index,
+          weatherCode: Number.isFinite(code) ? code : -1,
+          temperature: Number.isFinite(temp) ? `${Math.round(temp)}°C` : "--"
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      .slice(0, 24)
+      .map((entry, index) => ({
+        ...entry,
+        label: isTodaySelected && index === 0 ? "Now" : formatHour(new Date(entry.rawTime), effectiveTimezone)
+      }));
+
+    return filtered;
+  }, [effectiveTimezone, hourly.temperature_2m, hourly.time, hourly.weather_code, selectedDayKey, selectedDayRaw, timezoneMode]);
+
+  useEffect(() => {
+    if (hourlyItems.length === 0) {
+      setSelectedHourKey(null);
+      return;
+    }
+
+    if (!selectedHourKey || !hourlyItems.some((item) => item.key === selectedHourKey)) {
+      setSelectedHourKey(hourlyItems[0].key);
+    }
+  }, [hourlyItems, selectedHourKey]);
+
+  const selectedHourlyItem = hourlyItems.find((item) => item.key === selectedHourKey) ?? null;
+  const selectedHourlyIndex = selectedHourlyItem?.index;
+
+  const selectedWeatherCode =
+    selectedHourlyIndex !== undefined
+      ? Number((hourly.weather_code as Array<string | number | null> | undefined)?.[selectedHourlyIndex] ?? Number.NaN)
+      : Number(current.weather_code ?? Number.NaN);
+
+  const weatherLabel = getWeatherLabelFromCode(selectedWeatherCode);
+
+  const selectedTemperature =
+    selectedHourlyIndex !== undefined
+      ? formatMetric((hourly.temperature_2m as Array<string | number | null> | undefined)?.[selectedHourlyIndex], "°C")
+      : formatMetric(current.temperature_2m, "°C");
+
+  const selectedFeelsLike =
+    selectedHourlyIndex !== undefined
+      ? formatMetric((hourly.apparent_temperature as Array<string | number | null> | undefined)?.[selectedHourlyIndex], "°C")
+      : formatMetric(current.apparent_temperature, "°C");
+
+  const selectedPrecip =
+    selectedHourlyIndex !== undefined
+      ? formatMetric(
+          (hourly.precipitation_probability as Array<string | number | null> | undefined)?.[selectedHourlyIndex],
+          "%"
+        )
+      : formatMetric(current.precipitation, "mm");
+
+  const selectedWind =
+    selectedHourlyIndex !== undefined
+      ? formatMetric((hourly.wind_speed_10m as Array<string | number | null> | undefined)?.[selectedHourlyIndex], "km/h")
+      : formatMetric(current.wind_speed_10m, "km/h");
+
+  const selectedWindDirection =
+    selectedHourlyIndex !== undefined
+      ? formatMetric(
+          (hourly.wind_direction_10m as Array<string | number | null> | undefined)?.[selectedHourlyIndex],
+          "deg"
+        )
+      : formatMetric(current.wind_direction_10m, "deg");
+
+  const selectedSunrise = formatTimeValue((daily.sunrise as Array<string | number | null> | undefined)?.[selectedDayIndex], effectiveTimezone);
+  const selectedSunset = formatTimeValue((daily.sunset as Array<string | number | null> | undefined)?.[selectedDayIndex], effectiveTimezone);
+  const selectedMoonrise = formatTimeValue((daily.moonrise as Array<string | number | null> | undefined)?.[selectedDayIndex], effectiveTimezone);
+  const selectedMoonset = formatTimeValue((daily.moonset as Array<string | number | null> | undefined)?.[selectedDayIndex], effectiveTimezone);
+
+  const selectedSlotLabel = selectedHourlyItem?.label ?? "Now";
+
+  function applyCustomTimezone() {
+    const trimmed = customTimezoneInput.trim();
+    if (!trimmed) {
+      setTimezoneError("Enter a timezone like Asia/Kolkata.");
+      return;
+    }
+    if (!isValidTimezone(trimmed)) {
+      setTimezoneError("Invalid timezone. Try a value like Europe/Berlin or America/New_York.");
+      return;
+    }
+
+    setCustomTimezoneApplied(trimmed);
+    setTimezoneMode("custom");
+    setTimezoneError(null);
+  }
 
   return (
     <div className="layout">
       <aside className="panel">
         <h1>Photo Assist</h1>
         <p className="subtitle">Find perfect light with real-time weather and astronomy context.</p>
+
+        <div className="timezoneCard">
+          <label htmlFor="timezoneMode" className="timezoneLabel">
+            Timezone
+          </label>
+          <select
+            id="timezoneMode"
+            className="timezoneSelect"
+            value={timezoneMode}
+            onChange={(event) => {
+              setTimezoneMode(event.target.value as TimezoneMode);
+              setTimezoneError(null);
+            }}
+          >
+            <option value="location">Location ({locationTimezone})</option>
+            <option value="user">Your Local ({userTimezone})</option>
+            <option value="utc">UTC</option>
+            <option value="custom">Custom</option>
+          </select>
+
+          <div className="timezoneCustomRow">
+            <input
+              type="text"
+              value={customTimezoneInput}
+              onChange={(event) => setCustomTimezoneInput(event.target.value)}
+              placeholder="e.g. Asia/Kolkata"
+              className="timezoneInput"
+              aria-label="Custom timezone"
+            />
+            <button type="button" className="timezoneApplyBtn" onClick={applyCustomTimezone}>
+              Apply
+            </button>
+          </div>
+
+          {timezoneMode === "custom" && customTimezoneApplied && (
+            <div className="hint">Using: {effectiveTimezone}</div>
+          )}
+          {timezoneError && <p className="error">{timezoneError}</p>}
+        </div>
 
         <fieldset className="mapModeGroup" aria-label="Map style">
           <legend className="mapModeLegend">Map Type</legend>
@@ -285,29 +602,67 @@ export default function App() {
           {dataLoading && <p className="hint">Loading weather and astro data...</p>}
 
           {locationData && !dataLoading && (
-            <div className="dataGrid">
-              <div><strong>Weather:</strong> {weatherLabel}</div>
-              <div><strong>Temp:</strong> {current.temperature_2m} °C</div>
-              <div><strong>Feels Like:</strong> {current.apparent_temperature} °C</div>
-              <div><strong>Humidity:</strong> {current.relative_humidity_2m} %</div>
-              <div><strong>Wind:</strong> {current.wind_speed_10m} km/h</div>
-              <div><strong>Wind Direction:</strong> {current.wind_direction_10m} deg</div>
-              <div><strong>Cloud Total:</strong> {current.cloud_cover} %</div>
-              <div><strong>Cloud Low:</strong> {current.cloud_cover_low} %</div>
-              <div><strong>Cloud Mid:</strong> {current.cloud_cover_mid} %</div>
-              <div><strong>Cloud High:</strong> {current.cloud_cover_high} %</div>
-              <div><strong>Sunrise:</strong> {String(daily.sunrise?.[0] ?? "N/A")}</div>
-              <div><strong>Sunset:</strong> {String(daily.sunset?.[0] ?? "N/A")}</div>
-              <div><strong>Moonrise:</strong> {String(daily.moonrise?.[0] ?? "N/A")}</div>
-              <div><strong>Moonset:</strong> {String(daily.moonset?.[0] ?? "N/A")}</div>
-            </div>
+            <>
+              <div className="dataGrid">
+                <div>
+                  <strong>Selected Slot:</strong> {selectedSlotLabel}
+                </div>
+                <div>
+                  <strong>Weather:</strong> {weatherLabel}
+                </div>
+                <div>
+                  <strong>Temp:</strong> {selectedTemperature}
+                </div>
+                <div>
+                  <strong>Feels Like:</strong> {selectedFeelsLike}
+                </div>
+                <div>
+                  <strong>Precipitation:</strong> {selectedPrecip}
+                </div>
+                <div>
+                  <strong>Wind:</strong> {selectedWind}
+                </div>
+                <div>
+                  <strong>Wind Direction:</strong> {selectedWindDirection}
+                </div>
+                <div>
+                  <strong>Humidity:</strong> {formatMetric(current.relative_humidity_2m, "%")}
+                </div>
+                <div>
+                  <strong>Cloud Total:</strong> {formatMetric(current.cloud_cover, "%")}
+                </div>
+                <div>
+                  <strong>Cloud Low:</strong> {formatMetric(current.cloud_cover_low, "%")}
+                </div>
+                <div>
+                  <strong>Cloud Mid:</strong> {formatMetric(current.cloud_cover_mid, "%")}
+                </div>
+                <div>
+                  <strong>Cloud High:</strong> {formatMetric(current.cloud_cover_high, "%")}
+                </div>
+                <div><strong>Sunrise:</strong> {selectedSunrise}</div>
+                <div><strong>Sunset:</strong> {selectedSunset}</div>
+                <div><strong>Moonrise:</strong> {selectedMoonrise}</div>
+                <div><strong>Moonset:</strong> {selectedMoonset}</div>
+              </div>
+              <HourlyForecast items={hourlyItems} selectedKey={selectedHourKey} onSelect={setSelectedHourKey} />
+              <DailyForecast
+                items={dailyItems}
+                selectedKey={dailyItems[selectedDayIndex]?.key ?? null}
+                onSelect={(key) => {
+                  const index = dailyItems.findIndex((item) => item.key === key);
+                  if (index >= 0) {
+                    setSelectedDayIndex(index);
+                    setSelectedHourKey(null);
+                  }
+                }}
+              />
+            </>
           )}
         </section>
       </aside>
 
-      <main className="mapWrapper">
-        <div className="map" ref={mapContainerRef} />
-      </main>
+      <main ref={mapContainerRef} className="mapContainer" />
     </div>
   );
 }
